@@ -23,6 +23,34 @@ if (-not ([Security.Principal.WindowsPrincipal]$id).IsInRole([Security.Principal
 }
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
+# ---- 0. Clock ---------------------------------------------------------------
+# A wrong RTC (fresh OEM laptops) makes Tailscale register an already-expired node key and breaks every
+# certificate later. Windows Time refuses large corrections by default, so set the clock from a plain-HTTP
+# Date header first, then let w32time keep it.
+Say 'Clock'
+function Get-NetTime {
+    try {
+        $r = Invoke-WebRequest -UseBasicParsing 'http://www.msftconnecttest.com/connecttest.txt' -TimeoutSec 10
+        $d = [DateTime]::ParseExact($r.Headers['Date'], 'r', [Globalization.CultureInfo]::InvariantCulture)
+        return [DateTime]::SpecifyKind($d, 'Utc')
+    } catch { return $null }
+}
+$net = Get-NetTime
+if ($net) {
+    $off = ((Get-Date).ToUniversalTime() - $net).TotalMinutes
+    if ([math]::Abs($off) -gt 2) {
+        Say ("Clock is off by {0:N0} minutes; setting it from the network" -f $off)
+        Set-Date -Date $net.ToLocalTime() | Out-Null
+        $w = 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\Config'
+        Set-ItemProperty $w -Name MaxPosPhaseCorrection -Value 0xFFFFFFFF -Type DWord
+        Set-ItemProperty $w -Name MaxNegPhaseCorrection -Value 0xFFFFFFFF -Type DWord
+        w32tm /config /manualpeerlist:"time.windows.com,0x8" /syncfromflags:manual /update | Out-Null
+        Set-Service w32time -StartupType Automatic; Restart-Service w32time -ErrorAction SilentlyContinue
+        w32tm /resync /force 2>$null | Out-Null
+    }
+    "clock: $(Get-Date -Format s) local (network $($net.ToLocalTime().ToString('s')))"
+} else { Write-Host 'clock: could not reach the network time reference; check the date by hand' -ForegroundColor Yellow }
+
 # ---- 1. OpenSSH Server ------------------------------------------------------
 Say 'OpenSSH Server'
 $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' | Select-Object -First 1
@@ -74,9 +102,10 @@ while ((Get-Date) -lt $deadline) {
 
 function TsState { try { (& $ts status --json 2>$null) | ConvertFrom-Json } catch { $null } }
 
-function TsUp($tagged) {
+function TsUp($tagged, $reauth) {
     $flags = @("up", "--hostname=$n", "--accept-routes", "--timeout=10m")
     if ($tagged) { $flags += "--advertise-tags=tag:fleet" } else { $flags += "--reset" }
+    if ($reauth) { $flags += "--force-reauth" }
     # The tray GUI (tailscale-ipn) owns the daemon connection; kill it so 'up' from here is authorized.
     Get-Process tailscale-ipn -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     Say ("tailscale " + ($flags -join ' '))
@@ -109,6 +138,10 @@ if (-not ($st -and $st.BackendState -eq 'Running')) {
         $out = TsUp $false
         $st = TsState
     }
+} elseif ($st.Self.Expired -or ($st.Self.KeyExpiry -and ([DateTime]::Parse($st.Self.KeyExpiry).ToUniversalTime() -lt (Get-Date).ToUniversalTime()))) {
+    Say "This node's key is expired (it joined with a wrong clock); re-authenticating"
+    $out = TsUp $true $true
+    $st = TsState
 } elseif ($st.Self.HostName -ne $n) {
     Say "Renaming tailnet node $($st.Self.HostName) -> $n"
     & $ts set --hostname=$n 2>&1 | Write-Host
@@ -124,4 +157,6 @@ Say 'DONE - send these lines back if asked'
 "TS IP : $(& $ts ip -4 2>$null)"
 "TAGS  : $(if ($st) { $st.Self.Tags -join ',' })"
 "STATE : $(if ($st) { $st.BackendState })"
+"KEYEXP: $(if ($st) { $st.Self.KeyExpiry })  (must be in the future)"
+"CLOCK : $(Get-Date -Format s)"
 "SSHD  : $((Get-Service sshd).Status)"
