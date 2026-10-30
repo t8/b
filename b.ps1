@@ -57,8 +57,28 @@ $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' | Select-Object -Fi
 if (-not $cap) { $cap = [pscustomobject]@{ Name = 'OpenSSH.Server~~~~0.0.1.0'; State = 'NotPresent' } }
 if ($cap.State -ne 'Installed') { Add-WindowsCapability -Online -Name $cap.Name | Out-Null }
 if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) {
-    Say 'Capability install failed; trying winget OpenSSH'
+    # The capability needs Windows Update; OEM images (and a wrong clock) break it. Win32-OpenSSH from GitHub
+    # is what the fleet's other Windows boxes run (same layout 10-network.ps1 expects).
+    Say 'Capability install failed; installing Win32-OpenSSH from GitHub'
+    $zip = Join-Path $env:TEMP 'OpenSSH-Win64.zip'
+    Invoke-WebRequest -UseBasicParsing 'https://github.com/PowerShell/Win32-OpenSSH/releases/latest/download/OpenSSH-Win64.zip' -OutFile $zip
+    $tmp = Join-Path $env:TEMP 'openssh-extract'
+    if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
+    Expand-Archive -Path $zip -DestinationPath $tmp -Force
+    $inner = Get-ChildItem $tmp -Directory | Select-Object -First 1
+    $root = 'C:\Program Files\OpenSSH-Win64'
+    New-Item -ItemType Directory -Force $root | Out-Null
+    Copy-Item -Path (Join-Path $inner.FullName '*') -Destination $root -Recurse -Force
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'install-sshd.ps1') | Out-Null
+    $env:Path = "$env:Path;$root"
+}
+if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) {
+    Say 'Zip install failed too; trying winget OpenSSH'
     winget install --id Microsoft.OpenSSH.Preview -e --accept-source-agreements --accept-package-agreements | Out-Null
+}
+if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) {
+    Write-Host 'sshd service still missing; stop here and report the messages above.' -ForegroundColor Red
+    return
 }
 Set-Service sshd -StartupType Automatic
 Start-Service sshd
