@@ -1,11 +1,16 @@
 # cascadia fleet - Windows bootstrap
-# Run from an elevated PowerShell:  irm https://github.com/t8/b/raw/main/b.ps1 | iex
+# Run from an elevated PowerShell:
+#   irm https://github.com/t8/b/raw/main/b.ps1 | iex                            # joins as cascadia-<computername>
+#   $n='cascadia-booth-a'; irm https://github.com/t8/b/raw/main/b.ps1 | iex    # joins as cascadia-booth-a
 # Installs OpenSSH Server (PowerShell default shell), installs the orchestrator
 # public key for admin logins, keeps the box awake, installs Tailscale and joins
-# the tailnet as $n with tag:fleet. Idempotent; safe to re-run.
+# the tailnet as $n with tag:fleet. Idempotent; safe to re-run. Re-running with a
+# different $n renames an already-joined node.
 
 $ErrorActionPreference = 'Continue'
-$n   = 'cascadia-echo'
+if (-not $n) { $n = $env:FLEET_NAME }
+if (-not $n) { $n = 'cascadia-' + $env:COMPUTERNAME.ToLower() }
+$n   = (($n -replace '[^A-Za-z0-9-]', '-').Trim('-')).ToLower()
 $key = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAJIkJVfHYFjQsKYJl9vx4gn/tXa/tzMLVHkE/ORrfA3 cascadia-orchestrator'
 $ts  = 'C:\Program Files\Tailscale\tailscale.exe'
 
@@ -104,11 +109,17 @@ if (-not ($st -and $st.BackendState -eq 'Running')) {
         $out = TsUp $false
         $st = TsState
     }
+} elseif ($st.Self.HostName -ne $n) {
+    Say "Renaming tailnet node $($st.Self.HostName) -> $n"
+    & $ts set --hostname=$n 2>&1 | Write-Host
+    Start-Sleep 3
+    $st = TsState
 }
 
 # ---- 6. Report --------------------------------------------------------------
 Say 'DONE - send these lines back if asked'
 "HOST  : $env:COMPUTERNAME"
+"NODE  : $(if ($st) { $st.Self.HostName })"
 "USER  : $env:USERNAME"
 "TS IP : $(& $ts ip -4 2>$null)"
 "TAGS  : $(if ($st) { $st.Self.Tags -join ',' })"
