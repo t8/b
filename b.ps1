@@ -22,7 +22,7 @@ if (-not ([Security.Principal.WindowsPrincipal]$id).IsInRole([Security.Principal
     return
 }
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-Write-Host 'cascadia bootstrap v3 (clock, sshd via capability/MSI/zip, tailscale)' -ForegroundColor Cyan
+Write-Host 'cascadia bootstrap v4 (clock, sshd via capability[2 min cap]/MSI/zip, tailscale)' -ForegroundColor Cyan
 
 # ---- 0. Clock ---------------------------------------------------------------
 # A wrong RTC (fresh OEM laptops) makes Tailscale register an already-expired node key and breaks every
@@ -56,11 +56,17 @@ if ($net) {
 Say 'OpenSSH Server'
 function Have-Sshd { [bool](Get-Service sshd -ErrorAction SilentlyContinue) }
 if (-not (Have-Sshd)) {
-    try {
+    # Add-WindowsCapability talks to Windows Update and can hang for a long time on OEM images: cap it at 2 minutes.
+    $capJob = Start-Job -ScriptBlock {
         $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' -ErrorAction Stop | Select-Object -First 1
-        if ($cap -and $cap.State -ne 'Installed') { Add-WindowsCapability -Online -Name $cap.Name -ErrorAction Stop | Out-Null }
-        Write-Host "capability: $(if ($cap) { $cap.State } else { 'not offered on this image' })"
-    } catch { Write-Host "capability: failed ($($_.Exception.Message))" -ForegroundColor Yellow }
+        if (-not $cap) { return 'not offered on this image' }
+        if ($cap.State -ne 'Installed') { Add-WindowsCapability -Online -Name $cap.Name -ErrorAction Stop | Out-Null }
+        return (Get-WindowsCapability -Online -Name $cap.Name).State
+    }
+    if (Wait-Job $capJob -Timeout 120) {
+        try { Write-Host "capability: $(Receive-Job $capJob -ErrorAction Stop)" } catch { Write-Host "capability: failed ($($_.Exception.Message))" -ForegroundColor Yellow }
+    } else { Stop-Job $capJob -ErrorAction SilentlyContinue; Write-Host 'capability: gave up after 2 minutes (Windows Update not answering)' -ForegroundColor Yellow }
+    Remove-Job $capJob -Force -ErrorAction SilentlyContinue
 }
 if (-not (Have-Sshd)) {
     # Win32-OpenSSH MSI (what winget installs): registers and starts sshd + ssh-agent itself.
