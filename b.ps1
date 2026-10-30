@@ -22,7 +22,18 @@ if (-not ([Security.Principal.WindowsPrincipal]$id).IsInRole([Security.Principal
     return
 }
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-Write-Host 'cascadia bootstrap v4 (clock, sshd via capability[2 min cap]/MSI/zip, tailscale)' -ForegroundColor Cyan
+Write-Host 'cascadia bootstrap v5 (clock, sshd via capability[2 min cap]/MSI/zip, tailscale; transcript C:\b.log sent to the orchestrator)' -ForegroundColor Cyan
+try { Stop-Transcript | Out-Null } catch {}
+Start-Transcript -Path 'C:\b.log' -Force | Out-Null
+function Finish {
+    # Everything above lands in C:\b.log; hand it to the orchestrator over the tailnet so nobody has to paste it.
+    try { Stop-Transcript | Out-Null } catch {}
+    try {
+        $body = Get-Content -Raw 'C:\b.log'
+        Invoke-WebRequest -UseBasicParsing -Method Post -Uri "http://100.109.27.121:8787/log?host=$n" -Body $body -TimeoutSec 10 | Out-Null
+        Write-Host 'log sent to the orchestrator (copy at C:\b.log)' -ForegroundColor Green
+    } catch { Write-Host 'could not send the log over the tailnet; run:   type C:\b.log   and paste it' -ForegroundColor Yellow }
+}
 
 # ---- 0. Clock ---------------------------------------------------------------
 # A wrong RTC (fresh OEM laptops) makes Tailscale register an already-expired node key and breaks every
@@ -30,11 +41,15 @@ Write-Host 'cascadia bootstrap v4 (clock, sshd via capability[2 min cap]/MSI/zip
 # Date header first, then let w32time keep it.
 Say 'Clock'
 function Get-NetTime {
-    try {
-        $r = Invoke-WebRequest -UseBasicParsing 'http://www.msftconnecttest.com/connecttest.txt' -TimeoutSec 10
-        $d = [DateTime]::ParseExact($r.Headers['Date'], 'r', [Globalization.CultureInfo]::InvariantCulture)
-        return [DateTime]::SpecifyKind($d, 'Utc')
-    } catch { return $null }
+    foreach ($u in 'http://www.msftconnecttest.com/connecttest.txt', 'http://detectportal.firefox.com/success.txt', 'http://captive.apple.com/', 'http://neverssl.com/') {
+        try {
+            $r = Invoke-WebRequest -UseBasicParsing $u -TimeoutSec 8
+            $d = [DateTime]::ParseExact($r.Headers['Date'], 'r', [Globalization.CultureInfo]::InvariantCulture)
+            Write-Host "time reference: $u"
+            return [DateTime]::SpecifyKind($d, 'Utc')
+        } catch { Write-Host "time reference $u failed: $($_.Exception.Message)" -ForegroundColor Yellow }
+    }
+    return $null
 }
 $net = Get-NetTime
 if ($net) {
@@ -48,6 +63,8 @@ if ($net) {
         w32tm /config /manualpeerlist:"time.windows.com,0x8" /syncfromflags:manual /update | Out-Null
         Set-Service w32time -StartupType Automatic; Restart-Service w32time -ErrorAction SilentlyContinue
         w32tm /resync /force 2>$null | Out-Null
+        # Tailscale keeps TLS/relay state computed under the old clock; restart it so the tunnel comes up.
+        if (Get-Service Tailscale -ErrorAction SilentlyContinue) { Restart-Service Tailscale -ErrorAction SilentlyContinue; Write-Host 'tailscale service restarted after the clock change' }
     }
     "clock: $(Get-Date -Format s) local (network $($net.ToLocalTime().ToString('s')))"
 } else { Write-Host 'clock: could not reach the network time reference; check the date by hand' -ForegroundColor Yellow }
@@ -100,7 +117,8 @@ if (-not (Have-Sshd)) {
     } catch { Write-Host "zip: failed ($($_.Exception.Message))" -ForegroundColor Yellow }
 }
 if (-not (Have-Sshd)) {
-    Write-Host 'sshd service still missing after capability, MSI and zip attempts. Stop here and send the lines above.' -ForegroundColor Red
+    Write-Host 'sshd service still missing after capability, MSI and zip attempts.' -ForegroundColor Red
+    Finish
     return
 }
 Set-Service sshd -StartupType Automatic
@@ -202,4 +220,5 @@ Say 'DONE - send these lines back if asked'
 "STATE : $(if ($st) { $st.BackendState })"
 "KEYEXP: $(if ($st) { $st.Self.KeyExpiry })  (must be in the future)"
 "CLOCK : $(Get-Date -Format s)"
-"SSHD  : $((Get-Service sshd).Status)"
+"SSHD  : $((Get-Service sshd).Status)  $((Get-CimInstance Win32_Service -Filter "Name='sshd'").PathName)"
+Finish
