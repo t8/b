@@ -22,7 +22,7 @@ if (-not ([Security.Principal.WindowsPrincipal]$id).IsInRole([Security.Principal
     return
 }
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-Write-Host 'cascadia bootstrap v6 (clock first and hard, sshd via capability[2 min cap]/MSI/zip, tailscale only once the clock is right; log posted to the orchestrator)' -ForegroundColor Cyan
+Write-Host 'cascadia bootstrap v7 (clock, sshd, one Tailscale attempt only; log posted to the orchestrator over the LAN or the tailnet)' -ForegroundColor Cyan
 try { Stop-Transcript | Out-Null } catch {}
 Start-Transcript -Path 'C:\b.log' -Force | Out-Null
 function Send-Log($tag) {
@@ -182,7 +182,7 @@ while ((Get-Date) -lt $deadline) {
 function TsState { try { (& $ts status --json 2>$null) | ConvertFrom-Json } catch { $null } }
 
 function TsUp($tagged, $reauth) {
-    $flags = @("up", "--hostname=$n", "--accept-routes", "--timeout=4m")
+    $flags = @("up", "--hostname=$n", "--accept-routes", "--timeout=2m")
     if ($tagged) { $flags += "--advertise-tags=tag:fleet" } else { $flags += "--reset" }
     if ($reauth) { $flags += "--force-reauth" }
     # The tray GUI (tailscale-ipn) owns the daemon connection; kill it so 'up' from here is authorized.
@@ -215,17 +215,11 @@ if (-not $clockOk) {
 }
 $st = TsState
 if (-not ($st -and $st.BackendState -eq 'Running')) {
+    # One tagged attempt, two minutes. The orchestrator reaches these laptops over the LAN as well, so a
+    # Tailscale join that needs admin-console attention must not hold the bootstrap hostage.
     $out = TsUp $true
     $st = TsState
-    if (-not ($st -and $st.BackendState -eq 'Running')) {
-        Say 'Tagged join did not complete; joining untagged (tag:fleet must then be added in the admin console)'
-        $out = TsUp $false
-        $st = TsState
-    }
-} elseif ($st.Self.Expired -or ($st.Self.KeyExpiry -and ([DateTime]::Parse($st.Self.KeyExpiry).ToUniversalTime() -lt (Get-Date).ToUniversalTime()))) {
-    Say "This node's key is expired (it joined with a wrong clock); re-authenticating"
-    $out = TsUp $true $true
-    $st = TsState
+    if (-not ($st -and $st.BackendState -eq 'Running')) { Write-Host 'Tailscale join did not complete; carrying on (the orchestrator will sort the tailnet side out).' -ForegroundColor Yellow }
 } elseif ($st.Self.HostName -ne $n) {
     Say "Renaming tailnet node $($st.Self.HostName) -> $n"
     & $ts set --hostname=$n 2>&1 | Write-Host
