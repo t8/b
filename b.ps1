@@ -22,18 +22,24 @@ if (-not ([Security.Principal.WindowsPrincipal]$id).IsInRole([Security.Principal
     return
 }
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-Write-Host 'cascadia bootstrap v5 (clock, sshd via capability[2 min cap]/MSI/zip, tailscale; transcript C:\b.log sent to the orchestrator)' -ForegroundColor Cyan
+Write-Host 'cascadia bootstrap v6 (clock first and hard, sshd via capability[2 min cap]/MSI/zip, tailscale only once the clock is right; log posted to the orchestrator)' -ForegroundColor Cyan
 try { Stop-Transcript | Out-Null } catch {}
 Start-Transcript -Path 'C:\b.log' -Force | Out-Null
-function Finish {
-    # Everything above lands in C:\b.log; hand it to the orchestrator over the tailnet so nobody has to paste it.
+function Send-Log($tag) {
+    # Everything so far is in C:\b.log; hand it to the orchestrator (tailnet address, else the office LAN address)
+    # so nobody has to paste it. Transcript is paused for the read and resumed.
     try { Stop-Transcript | Out-Null } catch {}
-    try {
-        $body = Get-Content -Raw 'C:\b.log'
-        Invoke-WebRequest -UseBasicParsing -Method Post -Uri "http://100.109.27.121:8787/log?host=$n" -Body $body -TimeoutSec 10 | Out-Null
-        Write-Host 'log sent to the orchestrator (copy at C:\b.log)' -ForegroundColor Green
-    } catch { Write-Host 'could not send the log over the tailnet; run:   type C:\b.log   and paste it' -ForegroundColor Yellow }
+    $sent = $false
+    $body = Get-Content -Raw 'C:\b.log'
+    foreach ($u in "http://100.109.27.121:8787/log?host=$n-$tag", "http://192.168.0.195:8787/log?host=$n-$tag") {
+        if ($sent) { break }
+        try { Invoke-WebRequest -UseBasicParsing -Method Post -Uri $u -Body $body -TimeoutSec 6 | Out-Null; $sent = $true } catch { }
+    }
+    Start-Transcript -Path 'C:\b.log' -Append | Out-Null
+    if ($sent) { Write-Host "log ($tag) sent to the orchestrator" -ForegroundColor Green }
+    else { Write-Host "could not send the log ($tag); if asked, run:   type C:\b.log   and paste it" -ForegroundColor Yellow }
 }
+function Finish { Send-Log 'done'; try { Stop-Transcript | Out-Null } catch {} }
 
 # ---- 0. Clock ---------------------------------------------------------------
 # A wrong RTC (fresh OEM laptops) makes Tailscale register an already-expired node key and breaks every
@@ -51,23 +57,33 @@ function Get-NetTime {
     }
     return $null
 }
+"clock before: $(Get-Date -Format s) local"
 $net = Get-NetTime
+$clockOk = $false
 if ($net) {
     $off = ((Get-Date).ToUniversalTime() - $net).TotalMinutes
     if ([math]::Abs($off) -gt 2) {
-        Say ("Clock is off by {0:N0} minutes; setting it from the network" -f $off)
-        Set-Date -Date $net.ToLocalTime() | Out-Null
+        Say ("Clock is off by {0:N0} minutes ({1:N1} days); fixing it" -f $off, ($off / 1440))
         $w = 'HKLM:\SYSTEM\CurrentControlSet\Services\W32Time\Config'
+        Stop-Service w32time -Force -ErrorAction SilentlyContinue
+        # Secure Time Seeding sets clocks from TLS handshakes and is the usual cause of a clock months off; turn it off.
+        Set-ItemProperty $w -Name UtilizeSslTimeData -Value 0 -Type DWord
         Set-ItemProperty $w -Name MaxPosPhaseCorrection -Value 0xFFFFFFFF -Type DWord
         Set-ItemProperty $w -Name MaxNegPhaseCorrection -Value 0xFFFFFFFF -Type DWord
-        w32tm /config /manualpeerlist:"time.windows.com,0x8" /syncfromflags:manual /update | Out-Null
-        Set-Service w32time -StartupType Automatic; Restart-Service w32time -ErrorAction SilentlyContinue
-        w32tm /resync /force 2>$null | Out-Null
-        # Tailscale keeps TLS/relay state computed under the old clock; restart it so the tunnel comes up.
+        Set-Date -Date $net.ToLocalTime() | Out-Null
+        "clock after Set-Date: $(Get-Date -Format s) local"
+        w32tm /config /manualpeerlist:"time.windows.com,0x9 pool.ntp.org,0x9" /syncfromflags:manual /reliable:no /update 2>&1 | Out-Null
+        Set-Service w32time -StartupType Automatic; Start-Service w32time -ErrorAction SilentlyContinue
+        Start-Sleep 2
+        $rs = (w32tm /resync /force 2>&1 | Out-String).Trim(); "w32tm resync: $rs"
+        "clock after resync: $(Get-Date -Format s) local"
         if (Get-Service Tailscale -ErrorAction SilentlyContinue) { Restart-Service Tailscale -ErrorAction SilentlyContinue; Write-Host 'tailscale service restarted after the clock change' }
     }
-    "clock: $(Get-Date -Format s) local (network $($net.ToLocalTime().ToString('s')))"
-} else { Write-Host 'clock: could not reach the network time reference; check the date by hand' -ForegroundColor Yellow }
+    $off2 = ((Get-Date).ToUniversalTime() - $net).TotalMinutes
+    $clockOk = [math]::Abs($off2) -lt 10
+    "clock: $(Get-Date -Format s) local; network $($net.ToLocalTime().ToString('s')); offset now {0:N1} min; ok=$clockOk" -f $off2
+} else { Write-Host 'clock: could not reach any network time reference; the date must be set by hand before Tailscale can work' -ForegroundColor Yellow }
+"ipv4: " + ((Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } | ForEach-Object { "$($_.InterfaceAlias)=$($_.IPAddress)" }) -join ' ')
 
 # ---- 1. OpenSSH Server ------------------------------------------------------
 Say 'OpenSSH Server'
@@ -146,6 +162,8 @@ Restart-Service sshd
 powercfg /change standby-timeout-ac 0 | Out-Null
 powercfg /change hibernate-timeout-ac 0 | Out-Null
 
+Send-Log 'sshd'
+
 # ---- 5. Tailscale -----------------------------------------------------------
 if (-not (Test-Path $ts)) {
     Say 'Installing Tailscale'
@@ -164,7 +182,7 @@ while ((Get-Date) -lt $deadline) {
 function TsState { try { (& $ts status --json 2>$null) | ConvertFrom-Json } catch { $null } }
 
 function TsUp($tagged, $reauth) {
-    $flags = @("up", "--hostname=$n", "--accept-routes", "--timeout=10m")
+    $flags = @("up", "--hostname=$n", "--accept-routes", "--timeout=4m")
     if ($tagged) { $flags += "--advertise-tags=tag:fleet" } else { $flags += "--reset" }
     if ($reauth) { $flags += "--force-reauth" }
     # The tray GUI (tailscale-ipn) owns the daemon connection; kill it so 'up' from here is authorized.
@@ -190,6 +208,11 @@ function TsUp($tagged, $reauth) {
     return $out
 }
 
+if (-not $clockOk) {
+    Write-Host 'Clock is not right yet; skipping the Tailscale join (a key issued under a wrong clock is born expired). Fix the date, then run this again.' -ForegroundColor Red
+    Finish
+    return
+}
 $st = TsState
 if (-not ($st -and $st.BackendState -eq 'Running')) {
     $out = TsUp $true
