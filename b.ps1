@@ -22,6 +22,7 @@ if (-not ([Security.Principal.WindowsPrincipal]$id).IsInRole([Security.Principal
     return
 }
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+Write-Host 'cascadia bootstrap v3 (clock, sshd via capability/MSI/zip, tailscale)' -ForegroundColor Cyan
 
 # ---- 0. Clock ---------------------------------------------------------------
 # A wrong RTC (fresh OEM laptops) makes Tailscale register an already-expired node key and breaks every
@@ -53,31 +54,47 @@ if ($net) {
 
 # ---- 1. OpenSSH Server ------------------------------------------------------
 Say 'OpenSSH Server'
-$cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' | Select-Object -First 1
-if (-not $cap) { $cap = [pscustomobject]@{ Name = 'OpenSSH.Server~~~~0.0.1.0'; State = 'NotPresent' } }
-if ($cap.State -ne 'Installed') { Add-WindowsCapability -Online -Name $cap.Name | Out-Null }
-if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) {
-    # The capability needs Windows Update; OEM images (and a wrong clock) break it. Win32-OpenSSH from GitHub
-    # is what the fleet's other Windows boxes run (same layout 10-network.ps1 expects).
-    Say 'Capability install failed; installing Win32-OpenSSH from GitHub'
-    $zip = Join-Path $env:TEMP 'OpenSSH-Win64.zip'
-    Invoke-WebRequest -UseBasicParsing 'https://github.com/PowerShell/Win32-OpenSSH/releases/latest/download/OpenSSH-Win64.zip' -OutFile $zip
-    $tmp = Join-Path $env:TEMP 'openssh-extract'
-    if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
-    Expand-Archive -Path $zip -DestinationPath $tmp -Force
-    $inner = Get-ChildItem $tmp -Directory | Select-Object -First 1
-    $root = 'C:\Program Files\OpenSSH-Win64'
-    New-Item -ItemType Directory -Force $root | Out-Null
-    Copy-Item -Path (Join-Path $inner.FullName '*') -Destination $root -Recurse -Force
-    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'install-sshd.ps1') | Out-Null
-    $env:Path = "$env:Path;$root"
+function Have-Sshd { [bool](Get-Service sshd -ErrorAction SilentlyContinue) }
+if (-not (Have-Sshd)) {
+    try {
+        $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' -ErrorAction Stop | Select-Object -First 1
+        if ($cap -and $cap.State -ne 'Installed') { Add-WindowsCapability -Online -Name $cap.Name -ErrorAction Stop | Out-Null }
+        Write-Host "capability: $(if ($cap) { $cap.State } else { 'not offered on this image' })"
+    } catch { Write-Host "capability: failed ($($_.Exception.Message))" -ForegroundColor Yellow }
 }
-if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) {
-    Say 'Zip install failed too; trying winget OpenSSH'
-    winget install --id Microsoft.OpenSSH.Preview -e --accept-source-agreements --accept-package-agreements | Out-Null
+if (-not (Have-Sshd)) {
+    # Win32-OpenSSH MSI (what winget installs): registers and starts sshd + ssh-agent itself.
+    Say 'Installing Win32-OpenSSH (MSI from GitHub)'
+    try {
+        $rel = Invoke-RestMethod -UseBasicParsing 'https://api.github.com/repos/PowerShell/Win32-OpenSSH/releases/latest' -Headers @{ 'User-Agent' = 'cascadia-bootstrap' }
+        $asset = $rel.assets | Where-Object { $_.name -like 'OpenSSH-Win64-v*.msi' } | Select-Object -First 1
+        if (-not $asset) { throw 'no OpenSSH-Win64-v*.msi in the latest release' }
+        $msi = Join-Path $env:TEMP $asset.name
+        Invoke-WebRequest -UseBasicParsing $asset.browser_download_url -OutFile $msi
+        Write-Host ("downloaded {0} ({1:N1} MB)" -f $asset.name, ((Get-Item $msi).Length / 1MB))
+        $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn /norestart" -Wait -PassThru
+        Write-Host "msiexec exit code $($p.ExitCode) (0 = ok, 3010 = ok, reboot later)"
+    } catch { Write-Host "msi: failed ($($_.Exception.Message))" -ForegroundColor Yellow }
 }
-if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) {
-    Write-Host 'sshd service still missing; stop here and report the messages above.' -ForegroundColor Red
+if (-not (Have-Sshd)) {
+    Say 'Installing Win32-OpenSSH (zip from GitHub)'
+    try {
+        $zip = Join-Path $env:TEMP 'OpenSSH-Win64.zip'
+        Invoke-WebRequest -UseBasicParsing 'https://github.com/PowerShell/Win32-OpenSSH/releases/latest/download/OpenSSH-Win64.zip' -OutFile $zip
+        Write-Host ("downloaded OpenSSH-Win64.zip ({0:N1} MB)" -f ((Get-Item $zip).Length / 1MB))
+        $tmp = Join-Path $env:TEMP 'openssh-extract'
+        if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
+        Expand-Archive -Path $zip -DestinationPath $tmp -Force
+        $inner = Get-ChildItem $tmp -Directory | Select-Object -First 1
+        $root = 'C:\Program Files\OpenSSH-Win64'
+        New-Item -ItemType Directory -Force $root | Out-Null
+        Copy-Item -Path (Join-Path $inner.FullName '*') -Destination $root -Recurse -Force
+        & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'install-sshd.ps1')
+        $env:Path = "$env:Path;$root"
+    } catch { Write-Host "zip: failed ($($_.Exception.Message))" -ForegroundColor Yellow }
+}
+if (-not (Have-Sshd)) {
+    Write-Host 'sshd service still missing after capability, MSI and zip attempts. Stop here and send the lines above.' -ForegroundColor Red
     return
 }
 Set-Service sshd -StartupType Automatic
