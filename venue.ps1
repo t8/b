@@ -22,7 +22,7 @@ $ip = @{ A = '10.42.0.1'; B = '10.42.0.2'; C = '10.42.0.3' }[$L]
 function Say($m) { Write-Host "`n>> $m" -ForegroundColor Cyan }
 try { Stop-Transcript | Out-Null } catch {}
 Start-Transcript -Path 'C:\venue.log' -Force | Out-Null
-Write-Host "cascadia venue fix v1: laptop $L ($env:COMPUTERNAME), booth address $ip" -ForegroundColor Cyan
+Write-Host "cascadia venue fix v2: laptop $L ($env:COMPUTERNAME), booth address $ip" -ForegroundColor Cyan
 
 Say 'adapters before'
 Get-NetAdapter | Where-Object { $_.Status -ne 'Not Present' } | ForEach-Object { "  {0,-16} {1,-12} {2,-10} {3}" -f $_.Name, $_.Status, $_.LinkSpeed, $_.InterfaceDescription }
@@ -33,16 +33,24 @@ $nic = Get-NetAdapter -Name booth -ErrorAction SilentlyContinue
 if ($nic -and $nic.Status -eq 'Up') { "  booth is already the live adapter ($($nic.InterfaceDescription), $($nic.LinkSpeed))" }
 else {
     if ($nic) { $stale = "booth-stale-$(Get-Date -Format HHmmss)"; Rename-NetAdapter -Name booth -NewName $stale -ErrorAction SilentlyContinue; "  stale visible adapter renamed $stale" }
-    # A ghost instance keeps the connection name in the registry even when Get-NetAdapter no longer lists it.
-    $netKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Network\{4D36E972-E325-11CE-BFC1-08002BE10318}'
+    # A ghost instance (the adapter as it was in the other USB-C port) keeps the name in two registry stores even when
+    # Get-NetAdapter no longer lists it, and Rename-NetAdapter then fails with "Object Exists" (B, 2026-11-03). Free the
+    # name in both stores and remove the ghost device itself; Windows re-creates it fresh if that port is ever used again.
     $visible = @(Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | ForEach-Object { $_.InterfaceGuid })
+    $stamp = Get-Date -Format HHmmss
+    $netKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Network\{4D36E972-E325-11CE-BFC1-08002BE10318}'
     foreach ($k in Get-ChildItem $netKey -ErrorAction SilentlyContinue) {
         $conn = Join-Path $k.PSPath 'Connection'
         $cname = (Get-ItemProperty -Path $conn -Name Name -ErrorAction SilentlyContinue).Name
-        if ($cname -eq 'booth' -and ($visible -notcontains $k.PSChildName)) {
-            Set-ItemProperty -Path $conn -Name Name -Value "booth-stale-$(Get-Date -Format HHmmss)"
-            "  ghost adapter $($k.PSChildName) held the name booth; freed in the registry"
-        }
+        if ($cname -eq 'booth' -and ($visible -notcontains $k.PSChildName)) { Set-ItemProperty -Path $conn -Name Name -Value "booth-stale-$stamp"; "  ghost $($k.PSChildName): connection name freed" }
+    }
+    foreach ($k in Get-ChildItem 'HKLM:\SYSTEM\CurrentControlSet\Control\NetworkSetup2\Interfaces' -ErrorAction SilentlyContinue) {
+        $kern = Join-Path $k.PSPath 'Kernel'
+        $alias = (Get-ItemProperty -Path $kern -Name IfAlias -ErrorAction SilentlyContinue).IfAlias
+        if ($alias -eq 'booth' -and ($visible -notcontains $k.PSChildName)) { Set-ItemProperty -Path $kern -Name IfAlias -Value "booth-stale-$stamp"; "  ghost $($k.PSChildName): interface alias freed" }
+    }
+    Get-PnpDevice -Class Net -ErrorAction SilentlyContinue | Where-Object { $_.Status -ne 'OK' -and $_.FriendlyName -match 'AX88179|RTL8156|USB.*(GbE|Ethernet)' } | ForEach-Object {
+        "  removing ghost device $($_.FriendlyName) [$($_.InstanceId)]"; & pnputil /remove-device $_.InstanceId 2>&1 | ForEach-Object { "    $_" }
     }
     $live = Get-NetAdapter | Where-Object $usbNic | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1
     if ($live) { "  live USB adapter: $($live.Name) ($($live.InterfaceDescription), $($live.LinkSpeed))" }
