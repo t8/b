@@ -6,8 +6,11 @@
 #      then runs the laptop's own fleet\provision\10-network.ps1: adapter `booth`, static 10.42.0.x, firewall
 #      rules, sshd restart (key-only), the wall's link reporter task
 #   2. Tailscale tunnel = Private network, sshd running + automatic, the SSH rule present on every profile
-#   3. prints a diagnosis (sshd listening, firewall profiles/rules, security products, addresses) and posts
-#      C:\venue.log to the orchestrator over the tailnet so nothing has to be pasted
+#   3. installs the booth network guard (net-guard.ps1 from this repo, every minute from boot: re-finds a moved
+#      adapter, restores the address, restarts what bound it) and offers to set up auto-logon (password stored as an
+#      LSA secret, typed at the keyboard, never logged)
+#   4. prints a diagnosis (sshd listening, firewall profiles/rules, security products, addresses) and posts
+#      C:\venue.log to the orchestrator over the tailnet when one is reachable
 $ErrorActionPreference = 'Continue'
 $id = [Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not ([Security.Principal.WindowsPrincipal]$id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -22,7 +25,7 @@ $ip = @{ A = '10.42.0.1'; B = '10.42.0.2'; C = '10.42.0.3' }[$L]
 function Say($m) { Write-Host "`n>> $m" -ForegroundColor Cyan }
 try { Stop-Transcript | Out-Null } catch {}
 Start-Transcript -Path 'C:\venue.log' -Force | Out-Null
-Write-Host "cascadia venue fix v2: laptop $L ($env:COMPUTERNAME), booth address $ip" -ForegroundColor Cyan
+Write-Host "cascadia venue fix v3: laptop $L ($env:COMPUTERNAME), booth address $ip" -ForegroundColor Cyan
 
 Say 'adapters before'
 Get-NetAdapter | Where-Object { $_.Status -ne 'Not Present' } | ForEach-Object { "  {0,-16} {1,-12} {2,-10} {3}" -f $_.Name, $_.Status, $_.LinkSpeed, $_.InterfaceDescription }
@@ -63,6 +66,31 @@ if (Test-Path "$prov\10-network.ps1") {
     cmd /c "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""$prov\10-network.ps1"" -Laptop $L -Usb C:\booth-usb 2>&1"
     "  10-network exit code $LASTEXITCODE"
 } else { Write-Host "  $prov\10-network.ps1 is missing; the payload copy was not restored on this laptop" -ForegroundColor Red }
+
+Say 'network guard (every minute from boot)'
+$guard = "$prov\net-guard.ps1"
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/t8/b/raw/main/net-guard.ps1' -OutFile "$env:TEMP\net-guard.ps1" -TimeoutSec 20
+    if (Test-Path $prov) { Copy-Item "$env:TEMP\net-guard.ps1" $guard -Force; "  net-guard.ps1 downloaded to $prov" }
+} catch { "  download of net-guard.ps1 failed ($($_.Exception.Message)); using the copy already on this laptop, if any" }
+if (Test-Path $guard) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $guard -Register -Laptop $L 2>&1 | ForEach-Object { "  $_" }
+    Start-Sleep -Seconds 20
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $guard -Status 2>&1 | Select-Object -Last 4 | ForEach-Object { "  $_" }
+} else { Write-Host "  no net-guard.ps1 available; the address will not heal itself after an adapter move" -ForegroundColor Yellow }
+
+Say 'auto-logon (so the windows come up after a power-on with nobody at the keyboard)'
+$autologon = "$prov\70-autologon.ps1"
+if (-not (Test-Path $autologon)) { try { Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/t8/b/raw/main/70-autologon.ps1' -OutFile $autologon -TimeoutSec 20; "  70-autologon.ps1 downloaded" } catch { } }
+$w = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+if ($w.AutoAdminLogon -eq '1') { "  already on for $($w.DefaultUserName)" }
+elseif (-not (Test-Path $autologon)) { "  70-autologon.ps1 not on this laptop; run it later from the repo" }
+else {
+    $ans = Read-Host "  set up auto-logon for $env:USERNAME now? You will type the password once (y/n)"
+    if ($ans -match '^y') { & powershell -NoProfile -ExecutionPolicy Bypass -File $autologon -User $env:USERNAME 2>&1 | ForEach-Object { "  $_" } }
+    else { "  skipped (70-autologon.ps1 any time at the keyboard)" }
+}
 
 Say 'tailscale tunnel as a Private network, sshd on'
 Set-NetConnectionProfile -InterfaceAlias Tailscale -NetworkCategory Private -ErrorAction SilentlyContinue
