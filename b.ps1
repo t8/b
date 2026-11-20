@@ -2,10 +2,15 @@
 # Run from an elevated PowerShell:
 #   irm https://github.com/t8/b/raw/main/b.ps1 | iex                            # joins as cascadia-<computername>
 #   $n='cascadia-booth-a'; irm https://github.com/t8/b/raw/main/b.ps1 | iex    # joins as cascadia-booth-a
+#   $n='cascadia-kit2-a'; irm https://github.com/t8/b/raw/main/b.ps1 | iex     # second booth kit, laptop A
 # Installs OpenSSH Server (PowerShell default shell), installs the orchestrator
-# public key for admin logins, keeps the box awake, installs Tailscale and joins
-# the tailnet as $n with tag:fleet. Idempotent; safe to re-run. Re-running with a
-# different $n renames an already-joined node.
+# public key for admin logins, keeps the box awake (AC and battery, lid does
+# nothing), turns Smart App Control off (it blocks unsigned binaries after some
+# reboot), offers auto-logon for this account (password typed once, kept as an
+# LSA secret), reports the hardware (CPU, GPU, RAM, disk, Windows build), installs
+# Tailscale and joins the tailnet as $n with tag:fleet, and posts C:\b.log to the
+# orchestrator over the LAN or the tailnet. Idempotent; safe to re-run.
+# $noautologon = 1 before the irm skips the auto-logon question.
 
 $ErrorActionPreference = 'Continue'
 if (-not $n) { $n = $env:FLEET_NAME }
@@ -22,7 +27,7 @@ if (-not ([Security.Principal.WindowsPrincipal]$id).IsInRole([Security.Principal
     return
 }
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-Write-Host 'cascadia bootstrap v7 (clock, sshd, one Tailscale attempt only; log posted to the orchestrator over the LAN or the tailnet)' -ForegroundColor Cyan
+Write-Host 'cascadia bootstrap v8 (clock, sshd, awake, Smart App Control off, auto-logon, hardware report, one Tailscale attempt; log posted to the orchestrator)' -ForegroundColor Cyan
 try { Stop-Transcript | Out-Null } catch {}
 Start-Transcript -Path 'C:\b.log' -Force | Out-Null
 function Send-Log($tag) {
@@ -158,9 +163,83 @@ if (-not $have) { Add-Content -Path $akf -Value $key -Encoding ascii }
 icacls.exe $akf /inheritance:r /grant '*S-1-5-32-544:F' /grant '*S-1-5-18:F' | Out-Null
 Restart-Service sshd
 
-# ---- 4. Fleet box: never sleep on AC ----------------------------------------
-powercfg /change standby-timeout-ac 0 | Out-Null
-powercfg /change hibernate-timeout-ac 0 | Out-Null
+# ---- 4. Fleet box: never sleep, lid does nothing, hibernate off -------------
+Say 'Power'
+foreach ($p in 'ac', 'dc') { foreach ($k in 'standby-timeout', 'hibernate-timeout', 'monitor-timeout') { powercfg /change "$k-$p" 0 | Out-Null } }
+powercfg /setacvalueindex SCHEME_CURRENT 4f971e89-eebd-4455-a8de-9e59040e7347 5ca83367-6e45-459f-a27b-476b1d01c936 0 | Out-Null
+powercfg /setdcvalueindex SCHEME_CURRENT 4f971e89-eebd-4455-a8de-9e59040e7347 5ca83367-6e45-459f-a27b-476b1d01c936 0 | Out-Null
+powercfg /setactive SCHEME_CURRENT | Out-Null
+powercfg /hibernate off | Out-Null
+'never sleep on AC and battery, lid close does nothing, hibernate off'
+
+# ---- 4b. Smart App Control off ---------------------------------------------
+# Windows 11 Home ships it in evaluation and may switch it on at a reboot; it then refuses every unsigned binary
+# (the Cascadia node included). 0 = off for good; applied at the next reboot.
+Say 'Smart App Control'
+$ciKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy'
+$sac = (Get-ItemProperty $ciKey -Name VerifiedAndReputablePolicyState -ErrorAction SilentlyContinue).VerifiedAndReputablePolicyState
+if ($null -ne $sac -and $sac -ne 0) { Set-ItemProperty -Path $ciKey -Name VerifiedAndReputablePolicyState -Value 0 -Type DWord; "was $sac (1 on, 2 evaluation): set to 0, off after the next reboot" } else { "already off ($sac)" }
+
+# ---- 4c. Auto-logon (booth laptops boot to the demo with nobody at the keyboard) --
+Say 'Auto-logon'
+$wl = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+if ($wl.AutoAdminLogon -eq '1') { "already on for $($wl.DefaultUserName)" }
+elseif ($noautologon) { 'skipped ($noautologon set)' }
+else {
+    $ans = Read-Host "Set up auto-logon for $env:USERNAME on this laptop? You will type its password once; it is stored as an LSA secret, never in clear text (y/n)"
+    if ($ans -match '^y') {
+        if (-not ('BoothLsa.Secret' -as [type])) {
+Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices;
+namespace BoothLsa { public static class Secret {
+  [StructLayout(LayoutKind.Sequential)] public struct LSA_UNICODE_STRING { public ushort Length; public ushort MaximumLength; public IntPtr Buffer; }
+  [StructLayout(LayoutKind.Sequential)] public struct LSA_OBJECT_ATTRIBUTES { public int Length; public IntPtr RootDirectory; public LSA_UNICODE_STRING ObjectName; public uint Attributes; public IntPtr SecurityDescriptor; public IntPtr SecurityQualityOfService; }
+  [DllImport("advapi32.dll")] static extern uint LsaOpenPolicy(ref LSA_UNICODE_STRING SystemName, ref LSA_OBJECT_ATTRIBUTES ObjectAttributes, uint DesiredAccess, out IntPtr PolicyHandle);
+  [DllImport("advapi32.dll")] static extern uint LsaStorePrivateData(IntPtr PolicyHandle, ref LSA_UNICODE_STRING KeyName, ref LSA_UNICODE_STRING PrivateData);
+  [DllImport("advapi32.dll")] static extern uint LsaClose(IntPtr ObjectHandle);
+  [DllImport("advapi32.dll")] static extern uint LsaNtStatusToWinError(uint status);
+  static LSA_UNICODE_STRING Str(string s) { var u = new LSA_UNICODE_STRING(); u.Buffer = Marshal.StringToHGlobalUni(s); u.Length = (ushort)(s.Length * 2); u.MaximumLength = (ushort)((s.Length + 1) * 2); return u; }
+  public static void Store(string key, string value) {
+    var attrs = new LSA_OBJECT_ATTRIBUTES(); attrs.Length = Marshal.SizeOf(attrs); var sys = new LSA_UNICODE_STRING(); IntPtr h;
+    uint st = LsaOpenPolicy(ref sys, ref attrs, 0x000F0FFF, out h); if (st != 0) throw new Exception("LsaOpenPolicy " + LsaNtStatusToWinError(st));
+    var k = Str(key); var v = Str(value);
+    try { st = LsaStorePrivateData(h, ref k, ref v); if (st != 0) throw new Exception("LsaStorePrivateData " + LsaNtStatusToWinError(st)); }
+    finally { Marshal.FreeHGlobal(k.Buffer); Marshal.FreeHGlobal(v.Buffer); LsaClose(h); }
+  } } }
+'@
+        }
+        $secure = Read-Host -AsSecureString -Prompt "Password for $env:COMPUTERNAME\$env:USERNAME"
+        $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+        try { $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr); if ($plain) { [BoothLsa.Secret]::Store('DefaultPassword', $plain) } } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr); $plain = $null }
+        $wlk = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+        New-Item -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\PasswordLess\Device' -Force | Out-Null
+        Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\PasswordLess\Device' -Name DevicePasswordLessBuildVersion -Value 0 -Type DWord
+        Set-ItemProperty -Path $wlk -Name AutoAdminLogon -Value '1'
+        Set-ItemProperty -Path $wlk -Name DefaultUserName -Value $env:USERNAME
+        Set-ItemProperty -Path $wlk -Name DefaultDomainName -Value $env:COMPUTERNAME
+        Remove-ItemProperty -Path $wlk -Name DefaultPassword -ErrorAction SilentlyContinue
+        "auto-logon on for $env:USERNAME (password in the LSA secret)"
+    } else { 'skipped' }
+}
+
+# ---- 4d. Hardware facts (the orchestrator plans the model layout from these) --
+Say 'Hardware'
+$cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+$osi = Get-CimInstance Win32_OperatingSystem
+$cs = Get-CimInstance Win32_ComputerSystem
+"MODEL : $($cs.Manufacturer) $($cs.Model)"
+"CPU   : $($cpu.Name.Trim()) ($($cpu.NumberOfCores) cores / $($cpu.NumberOfLogicalProcessors) threads)"
+"RAM   : $([math]::Round($cs.TotalPhysicalMemory / 1GB, 1)) GB"
+Get-CimInstance Win32_VideoController | ForEach-Object { "GPU   : $($_.Name)  driver $($_.DriverVersion)  $([math]::Round($_.AdapterRAM / 1GB, 1)) GB" }
+$npu = Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.FriendlyName -match 'NPU|Neural|AI Boost' } | Select-Object -First 1
+"NPU   : $(if ($npu) { $npu.FriendlyName } else { 'none listed' })"
+"DISK  : $([math]::Round((Get-PSDrive C).Free / 1GB)) GB free of $([math]::Round(((Get-PSDrive C).Used + (Get-PSDrive C).Free) / 1GB)) GB on C:"
+"OS    : $($osi.Caption) build $($osi.BuildNumber)  edition $((Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').EditionID)"
+"ACCT  : $env:USERDOMAIN\$env:USERNAME  localadmin=$(([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole('Administrators'))  profile=$env:USERPROFILE"
+"USBNIC: $(((Get-NetAdapter | Where-Object { $_.InterfaceDescription -match 'USB|AX88179|RTL8156' } | ForEach-Object { $_.Name + '=' + $_.Status + ' ' + $_.InterfaceDescription }) -join '; '))"
+"SAC   : $((Get-ItemProperty $ciKey -Name VerifiedAndReputablePolicyState -ErrorAction SilentlyContinue).VerifiedAndReputablePolicyState) (0 off)"
+"AUTOLG: $((Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon').AutoAdminLogon)"
+"LANIP : $(((Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } | ForEach-Object { $_.InterfaceAlias + '=' + $_.IPAddress }) -join ', '))"
 
 Send-Log 'sshd'
 
